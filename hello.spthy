@@ -1,0 +1,885 @@
+theory Hello_Protocol_Rules
+begin
+
+builtins: hashing, signing
+
+functions:
+    none/0,
+    hello_coop/0,
+
+/* Explicit secure-channel semantics with sender and receiver. */
+rule ChanOut_S[role="Channel"]:
+        [ Out_S($A,$B,x) ]
+      --[ ChanOut_S($A,$B,x) ]->
+        [ !Sec($A,$B,x) ]
+
+rule ChanIn_S[role="Channel"]:
+        [ !Sec($A,$B,x) ]
+      --[ ChanIn_S($A,$B,x) ]->
+        [ In_S($A,$B,x), Obs_S($A, $B, x) ]
+
+/* Rule representing the App registration in the Hello System */
+rule Register_App[role="App"]:
+    [
+        Fr(~app_sk),
+        !HelloSystemInit($OS, $TS, $ES_SS)
+    ]
+  --[
+        App_Initialized($App, ~app_sk),
+        Key_Pair_Generated($App, ~app_sk),
+        Neq($OS, $App), Neq($TS, $App), Neq($ES_SS, $App),
+        OnlyOne('Register_App')
+    ]->
+    [
+        !Ltk($App, ~app_sk), !Pk($App, pk(~app_sk)), !App_Registered($App, ~app_sk)
+    ]
+
+rule App_SendRequestToken[role="App"]:
+    [
+        !App_Registered($App, ~app_sk),
+        !Ltk($App, ~app_sk),
+        Fr(~nonce),
+        !HelloSystemInit($OS, $TS, $ES_SS)
+    ]
+  --[
+        OnlyOne(<$App, ~nonce>),
+        RequestSent($App, ~nonce)
+    ]->
+    [
+        Out_S($App, $OS, <'RequestToken', $App, hello_coop, ~nonce, sign(<$App, hello_coop, ~nonce>, ~app_sk)>),
+        App_Session($App, ~nonce)
+    ]
+
+rule App_ReceiveHelloIdToken[role="App"]:
+    [
+        !HelloSystemInit($OS, $TS, $ES_SS),
+        App_Session($App, ~nonce),
+        In_S($OS, $App, <'HelloIdToken', hello_coop, ~direct_identifier, $App, ~nonce, hello_id_token_sig>),
+        !Pk($TS, ts_pk)
+    ]
+  --[
+        Eq(verify(hello_id_token_sig, <hello_coop, ~direct_identifier, $App, ~nonce>, ts_pk), true),
+        Neq($TS, $App), Neq($App, $OS),
+        RPLoginAccepted($App, ~direct_identifier, ~nonce, hello_id_token_sig),
+        AppSeesHelloIdToken($App, ~direct_identifier),
+        Finish()
+    ]->
+    [ ]
+
+/* OP/IdP Process Rules */
+rule IdP_Init[role="IdP"]:
+    [
+        Fr(~idp_sk),
+        !HelloSystemInit($OS, $TS, $ES_SS)
+    ]
+  --[
+        IdP_Initialized(),
+        OnlyOne('IdP_Init'),
+        Neq($OS, $IdP), Neq($TS, $IdP), Neq($ES_SS, $IdP),
+        Key_Pair_Generated($IdP, ~idp_sk)
+    ]->
+    [
+        !Pk($IdP, pk(~idp_sk)), !Ltk($IdP, ~idp_sk), !IdP_Init($IdP, ~idp_sk)
+    ]
+
+rule IdP_Register_Users[role="IdP"]:
+    [ !IdP_Init($IdP, ~idp_sk) ]
+  --[ UserRegistered($IdP, $User) ]->
+    [ !IdPUser($IdP, $User) ]
+
+rule IdP_Receive_OIDCRequest[role="IdP"]:
+    [
+        !IdP_Init($IdP, ~idp_sk),
+        !HelloSystemInit($OS, $TS, $ES_SS),
+        In_S($OS, $IdP, <'OIDCRequest', ~session_id>),
+        !Ltk($IdP, ~idp_sk),
+        !IdPUser($IdP, $User) 
+    ]
+  --[
+        OIDCRequestReceived(~session_id),
+        UserParticipated($IdP, $User, ~session_id),
+        Neq($OS, $IdP), Neq($TS, $IdP), Neq($ES_SS, $IdP)
+    ]->
+    [
+        Out_S($IdP, $OS, <'IdToken', $IdP, $User, ~session_id, sign(<$IdP, $User, ~session_id>, ~idp_sk)>)
+    ]
+
+/* Hello System Init */
+rule Hello_Init[role="HelloSystem"]:
+    [
+        Fr(~os_sk), Fr(~ts_sk), Fr(~es_ss_sk)
+    ]
+  --[
+        HelloSystemInitialized(),
+        OnlyOne('Hello_Init'),
+        Key_Pair_Generated($OS, ~os_sk),
+        Key_Pair_Generated($TS, ~ts_sk),
+        Key_Pair_Generated($ES_SS, ~es_ss_sk),
+        Neq($OS, $TS), Neq($OS, $ES_SS), Neq($TS, $ES_SS)
+    ]->
+    [
+        !Pk($OS, pk(~os_sk)), !Ltk($OS, ~os_sk),
+        !Pk($TS, pk(~ts_sk)), !Ltk($TS, ~ts_sk),
+        !Pk($ES_SS, pk(~es_ss_sk)), !Ltk($ES_SS, ~es_ss_sk),
+        !HelloSystemInit($OS, $TS, $ES_SS)
+    ]
+
+#ifdef Compromise
+rule CompromiseOS[role="Attacker"]:
+    [
+        !Ltk($OS, ~os_sk),
+        !HelloSystemInit($OS, $TS, $ES_SS)
+    ]
+  --[
+        Compromised($OS),
+        OnlyOne('ServiceCompromise')
+    ]->
+    [
+        !CompromisedService($OS),
+        Out(~os_sk)
+    ]
+
+rule CompromiseTS[role="Attacker"]:
+    [
+        !Ltk($TS, ~ts_sk),
+        !HelloSystemInit($OS, $TS, $ES_SS)
+    ]
+  --[
+        Compromised($TS),
+        CompromisedTS(),
+        OnlyOne('ServiceCompromise')
+     ]->
+    [
+        !CompromisedService($TS),
+        Out(~ts_sk)
+    ]
+
+rule CompromiseES_SS[role="Attacker"]:
+    [
+        !Ltk($ES_SS, ~es_ss_sk),
+        !HelloSystemInit($OS, $TS, $ES_SS)
+    ]
+  --[
+        Compromised($ES_SS),
+        OnlyOne('ServiceCompromise')
+    ]->
+    [
+        !CompromisedService($ES_SS),
+        Out(~es_ss_sk)
+    ]
+
+rule CompromiseOSMessage[role="Attacker"]:
+    [
+        !CompromisedService($OS),
+        !HelloSystemInit($OS, $TS, $ES_SS),
+        In(x), In($B)
+    ]
+  --[
+        CompromisedMessage($OS, x)
+    ]->
+    [
+        Out_S($OS, $B, x)
+    ]
+
+rule CompromiseTSMessage[role="Attacker"]:
+    [
+        !CompromisedService($TS),
+        !HelloSystemInit($OS, $TS, $ES_SS),
+        In(x), In($B)
+    ]
+  --[
+        CompromisedMessage($TS, x)
+    ]->
+    [
+        Out_S($TS, $B, x)
+    ]
+
+rule CompromiseES_SSMessage[role="Attacker"]:
+    [
+        !CompromisedService($ES_SS),
+        !HelloSystemInit($OS, $TS, $ES_SS),
+        In(x), In($B)
+    ]
+  --[
+        CompromisedMessage($ES_SS, x)
+    ]->
+    [
+        Out_S($ES_SS, $B, x)
+    ]
+#endif
+
+/* OS Process Rules */
+rule OS_Receive_And_Verify_RequestToken[role="OS"]:
+    [
+        !HelloSystemInit($OS, $TS, $ES_SS),
+        In_S($App, $OS, <'RequestToken', $App, hello_coop, ~nonce, request_token_sig>),
+        !App_Registered($App, ~app_sk),
+        !Pk($App, app_pk)
+    ]
+  --[
+        Eq(verify(request_token_sig, <$App, hello_coop, ~nonce>, app_pk), true),
+        OS_Received_RequestToken($App, ~nonce),
+        OnlyOne(<'OS', $App, ~nonce>)
+    ]->
+    [
+        OS_Wait_SessionToken_Request($App, ~nonce, request_token_sig)
+    ]
+
+rule OS_Send_SessionToken_Request[role="OS"]:
+    [
+        !HelloSystemInit($OS, $TS, $ES_SS),
+        OS_Wait_SessionToken_Request($App, ~nonce, request_token_sig)
+    ]
+  --[
+        OS_Sent_SessionToken_Request($App, ~nonce)
+    ]->
+    [
+        Out_S($OS, $TS, <'CreateSessionToken', <'RequestToken', $App, hello_coop, ~nonce, request_token_sig>>),
+        OS_Wait_SessionToken_Response($App, ~nonce)
+    ]
+
+rule OS_Receive_And_Verify_SessionToken[role="OS"]:
+    [
+        !HelloSystemInit($OS, $TS, $ES_SS),
+        OS_Wait_SessionToken_Response($App, ~nonce),
+        In_S($TS, $OS, <'SessionToken_1', ~session_id, $App, ~nonce, session_sig>),
+        !Pk($TS, ts_pk) 
+    ]
+  --[
+        Eq(verify(session_sig, <~session_id, $App, ~nonce>, ts_pk), true),
+        SessionStarted(~session_id, $App, ~nonce)
+    ]->
+    [
+        OS_Wait_OIDC_Request(~session_id, $App, ~nonce, session_sig)
+    ]
+
+rule OS_Send_OIDC_Request[role="OS"]:
+    [
+        !HelloSystemInit($OS, $TS, $ES_SS),
+        OS_Wait_OIDC_Request(~session_id, $App, ~nonce, session_sig)
+    ]
+  --[
+        OIDCRequestSent(~session_id),
+        Neq($OS, $IdP), Neq($IdP, $TS), Neq($IdP, $ES_SS), Neq($IdP, $App)
+    ]->
+    [
+        Out_S($OS, $IdP, <'OIDCRequest', ~session_id>),
+        OS_Wait_OIDC_Response(~session_id, $App, ~nonce, session_sig)
+    ]
+
+rule OS_Receive_And_Verify_IdToken[role="OS"]:
+    [
+        !HelloSystemInit($OS, $TS, $ES_SS),
+        OS_Wait_OIDC_Response(~session_id, $App, ~nonce, session_sig),
+        In_S($IdP, $OS, <'IdToken', $IdP, $User, ~session_id, id_token_sig>),
+        !Pk($IdP, idp_pk)
+    ]
+  --[
+        Neq($IdP, $App), Neq($IdP, $TS), Neq($IdP, $ES_SS), Neq($IdP, $OS),
+        Eq(verify(id_token_sig, <$IdP, $User, ~session_id>, idp_pk), true),
+        IdTokenReceived($IdP, $User, ~session_id)
+    ]->
+    [
+        OS_Wait_SubjectRecord_AccessToken_Request(~session_id, $App, ~nonce, session_sig, $IdP, $User, id_token_sig)
+    ]
+
+rule OS_Send_SubjectRecord_AccessToken_Request[role="OS"]:
+    [
+        !HelloSystemInit($OS, $TS, $ES_SS),
+        OS_Wait_SubjectRecord_AccessToken_Request(~session_id, $App, ~nonce, session_sig, $IdP, $User, id_token_sig)
+    ]
+  --[
+        SessionTokenAndIdTokenSent(~session_id, $App, ~nonce, $IdP, $User)
+    ]->
+    [
+        Out_S($OS, $TS, <
+            <'SessionToken_1', ~session_id, $App, ~nonce, session_sig>,
+            <'IdToken', $IdP, $User, ~session_id, id_token_sig>
+        >),
+        OS_Wait_SubjectRecord_AccessToken_Response(~session_id, $App, ~nonce, $IdP, $User)
+    ]
+
+rule OS_Receive_And_Verify_SubjectRecord_AccessToken[role="OS"]:
+    let
+        access_token_hash = h(<$IdP, $User>)
+    in
+    [
+        !HelloSystemInit($OS, $TS, $ES_SS),
+        OS_Wait_SubjectRecord_AccessToken_Response(~session_id, $App, ~nonce, $IdP, $User),
+        In_S($TS, $OS, <
+            <'SessionToken_2', ~session_id, $App, ~nonce, $IdP, $User, session_sig>,
+            <'SubjectRecord-AccessToken', access_token_hash, ~session_id, access_token_sig>
+        >),
+        !Pk($TS, ts_pk)
+    ]
+  --[
+        Eq(verify(session_sig, <~session_id, $App, ~nonce, $IdP, $User>, ts_pk), true),
+        Eq(verify(access_token_sig, <access_token_hash, ~session_id>, ts_pk), true),
+        SubjectRecordAccessTokenReceived(~session_id, $App, ~nonce, $IdP, $User)
+    ]->
+    [
+        OS_Wait_SubjectRecord_Request(~session_id, $App, ~nonce, $IdP, $User, session_sig, access_token_sig)
+    ]
+
+rule OS_Send_SubjectRecord_Request[role="OS"]:
+    let
+        access_token_hash = h(<$IdP, $User>)
+    in
+    [
+        !HelloSystemInit($OS, $TS, $ES_SS),
+        OS_Wait_SubjectRecord_Request(~session_id, $App, ~nonce, $IdP, $User, session_sig, access_token_sig)
+    ]
+  --[
+        SubjectRecordRequestSent(~session_id, $App, ~nonce, $IdP, $User)
+    ]->
+    [
+        Out_S($OS, $ES_SS, <'SubjectRecord-AccessToken', access_token_hash, ~session_id, access_token_sig>),
+        OS_Wait_SubjectRecord_Response(~session_id, $App, ~nonce, $IdP, $User, session_sig)
+    ]
+
+/* New User Branch  */
+rule OS_Receive_And_Verify_ErrorToken[role="OS"]:
+    let
+        error_token_hash = h(<$IdP, $User>)
+    in
+    [
+        !HelloSystemInit($OS, $TS, $ES_SS),
+        OS_Wait_SubjectRecord_Response(~session_id, $App, ~nonce, $IdP, $User, session_sig),
+        In_S($ES_SS, $OS, <'ErrorToken', error_token_hash, ~session_id, error_token_sig>),
+        !Pk($ES_SS, es_ss_pk)
+    ]
+  --[
+        Eq(verify(error_token_sig, <error_token_hash, ~session_id>, es_ss_pk), true),
+        Eq(error_token_hash, h(<$IdP, $User>)),
+        OS_Received_ErrorToken(~session_id, $App, ~nonce, $IdP, $User)
+    ]->
+    [
+        OS_Wait_New_User_Request(~session_id, $App, ~nonce, $IdP, $User, session_sig, error_token_sig)
+    ]
+
+rule OS_Send_New_User_Request[role="OS"]:
+    let
+        error_token_hash = h(<$IdP, $User>)
+    in
+    [
+        !HelloSystemInit($OS, $TS, $ES_SS),
+        OS_Wait_New_User_Request(~session_id, $App, ~nonce, $IdP, $User, session_sig, error_token_sig)
+    ]
+  --[
+        OS_Sent_New_User_Request(~session_id, $App, ~nonce, $IdP, $User)
+    ]->
+    [
+        Out_S($OS, $TS, <
+            <'SessionToken_2', ~session_id, $App, ~nonce, $IdP, $User, session_sig>,
+            <'ErrorToken', error_token_hash, ~session_id, error_token_sig>
+        >),
+        OS_Wait_New_User_Response(~session_id, $App, ~nonce, $IdP, $User)
+    ]
+
+rule OS_Receive_And_Verify_New_User_Response[role="OS"]:
+    let
+        subject_record_access_token_hash = h(<$IdP, $User>)
+        release_record_access_token_hash = h(<$App, ~hello_user_id>)
+    in
+    [
+        !HelloSystemInit($OS, $TS, $ES_SS),
+        OS_Wait_New_User_Response(~session_id, $App, ~nonce, $IdP, $User),
+        In_S($TS, $OS, <
+            <'HelloIdToken', hello_coop, ~direct_identifier, $App, ~nonce, hello_id_token_sig>,
+            <'SubjectRecord', $IdP, $User, ~hello_user_id, subject_record_sig>,
+            <'SubjectRecord-AccessToken', subject_record_access_token_hash, ~session_id, subject_record_access_token_sig>,
+            <'ReleaseRecord', $App, ~hello_user_id, ~direct_identifier, release_record_sig>,
+            <'ReleaseRecord-AccessToken', release_record_access_token_hash, ~session_id, release_record_access_token_sig>,
+            <'SessionToken_3', ~session_id, $App, ~nonce, $IdP, $User, ~hello_user_id, session_sig>
+        >),
+        !Pk($TS, ts_pk)
+    ]
+  --[
+        Eq(verify(hello_id_token_sig, <hello_coop, ~direct_identifier, $App, ~nonce>, ts_pk), true),
+        Eq(verify(subject_record_sig, <$IdP, $User, ~hello_user_id>, ts_pk), true),
+        Eq(verify(subject_record_access_token_sig, <subject_record_access_token_hash, ~session_id>, ts_pk), true),
+        Eq(verify(release_record_sig, <$App, ~hello_user_id, ~direct_identifier>, ts_pk), true),
+        Eq(verify(release_record_access_token_sig, <release_record_access_token_hash, ~session_id>, ts_pk), true),
+        Eq(verify(session_sig, <~session_id, $App, ~nonce, $IdP, $User, ~hello_user_id>, ts_pk), true),
+        OS_Received_New_User_Response(~session_id, $App, ~nonce, $IdP, $User, ~hello_user_id)
+    ]->
+    [
+        OS_Wait_Store_Record_Request(
+            <'SubjectRecord', $IdP, $User, ~hello_user_id, subject_record_sig>,
+            <'SubjectRecord-AccessToken', subject_record_access_token_hash, ~session_id, subject_record_access_token_sig>,
+            <'ReleaseRecord', $App, ~hello_user_id, ~direct_identifier, release_record_sig>,
+            <'ReleaseRecord-AccessToken', release_record_access_token_hash, ~session_id, release_record_access_token_sig>
+        ),
+        OS_Wait_Finalize_Session(<
+            <'HelloIdToken', hello_coop, ~direct_identifier, $App, ~nonce, hello_id_token_sig>,
+            <'SessionToken_3', ~session_id, $App, ~nonce, $IdP, $User, ~hello_user_id, session_sig>
+        >)
+    ]
+
+rule OS_Send_Store_Record_Request[role="OS"]:
+    let
+        subject_record_access_token_hash = h(<$IdP, $User>)
+        release_record_access_token_hash = h(<$App, ~hello_user_id>)
+    in
+    [
+        !HelloSystemInit($OS, $TS, $ES_SS),
+        OS_Wait_Store_Record_Request(
+            <'SubjectRecord', $IdP, $User, ~hello_user_id, subject_record_sig>,
+            <'SubjectRecord-AccessToken', subject_record_access_token_hash, ~session_id, subject_record_access_token_sig>,
+            <'ReleaseRecord', $App, ~hello_user_id, ~direct_identifier, release_record_sig>,
+            <'ReleaseRecord-AccessToken', release_record_access_token_hash, ~session_id, release_record_access_token_sig>
+        )
+    ]
+  --[
+        OS_Sent_StoreRecord_Request()
+    ]->
+    [
+        Out_S($OS, $ES_SS, <
+            <'SubjectRecord', $IdP, $User, ~hello_user_id, subject_record_sig>,
+            <'SubjectRecord-AccessToken', subject_record_access_token_hash, ~session_id, subject_record_access_token_sig>,
+            <'ReleaseRecord', $App, ~hello_user_id, ~direct_identifier, release_record_sig>,
+            <'ReleaseRecord-AccessToken', release_record_access_token_hash, ~session_id, release_record_access_token_sig>
+        >)
+    ]
+
+/* Returning User Branch  */
+rule OS_Receive_And_Verify_SubjectRecord[role="OS"]:
+    [
+        !HelloSystemInit($OS, $TS, $ES_SS),
+        OS_Wait_SubjectRecord_Response(~session_id, $App, ~nonce, $IdP, $User, session_sig),
+        In_S($ES_SS, $OS, <'SubjectRecord', $IdP, $User, ~hello_user_id, subject_record_sig>),
+        !Pk($TS, ts_pk)
+    ]
+  --[
+        Eq(verify(subject_record_sig, <$IdP, $User, ~hello_user_id>, ts_pk), true),
+        OS_Received_SubjectRecord(~session_id, $App, ~nonce, $IdP, $User, ~hello_user_id, subject_record_sig)
+    ]->
+    [
+        OS_Wait_ReleaseRecord_AccessToken_Request(
+            <'SessionToken_2', ~session_id, $App, ~nonce, $IdP, $User, session_sig>,
+            <'SubjectRecord', $IdP, $User, ~hello_user_id, subject_record_sig>
+        )
+    ]
+
+rule OS_Send_ReleaseRecord_AccessToken_Request[role="OS"]:
+    [
+        !HelloSystemInit($OS, $TS, $ES_SS),
+        OS_Wait_ReleaseRecord_AccessToken_Request(
+            <'SessionToken_2', ~session_id, $App, ~nonce, $IdP, $User, session_sig>,
+            <'SubjectRecord', $IdP, $User, ~hello_user_id, subject_record_sig>
+        )
+    ]
+    -->
+    [
+        Out_S($OS, $TS, <
+            <'SessionToken_2', ~session_id, $App, ~nonce, $IdP, $User, session_sig>,
+            <'SubjectRecord', $IdP, $User, ~hello_user_id, subject_record_sig>
+        >),
+        OS_Wait_ReleaseRecord_AccessToken_Response(
+            <'SessionToken_2', ~session_id, $App, ~nonce, $IdP, $User, session_sig>
+        )
+    ]
+
+rule OS_Receive_And_Verify_ReleaseRecord_AccessToken[role="OS"]:
+    let
+        release_record_access_token_hash = h(<$App, ~hello_user_id>)
+    in
+    [
+        !HelloSystemInit($OS, $TS, $ES_SS),
+        OS_Wait_ReleaseRecord_AccessToken_Response(
+            <'SessionToken_2', ~session_id, $App, ~nonce, $IdP, $User, session_sig>
+        ),
+        In_S($TS, $OS, <
+            <'SessionToken_3', ~session_id, $App, ~nonce, $IdP, $User, ~hello_user_id, session_sig>,
+            <'ReleaseRecord-AccessToken', release_record_access_token_hash, ~session_id, release_record_access_token_sig>
+        >),
+        !Pk($TS, ts_pk)
+    ]
+  --[
+        Eq(verify(session_sig, <~session_id, $App, ~nonce, $IdP, $User, ~hello_user_id>, ts_pk), true),
+        Eq(verify(release_record_access_token_sig, <release_record_access_token_hash, ~session_id>, ts_pk), true),
+        Eq(h(<$App, ~hello_user_id>), release_record_access_token_hash)
+    ]->
+    [
+        OS_Wait_ReleaseRecord_Request(
+            <'SessionToken_3', ~session_id, $App, ~nonce, $IdP, $User, ~hello_user_id, session_sig>,
+            <'ReleaseRecord-AccessToken', release_record_access_token_hash, ~session_id, release_record_access_token_sig>
+        )
+    ]
+
+rule OS_Send_ReleaseRecord_Request[role="OS"]:
+    let
+        release_record_access_token_hash = h(<$App, ~hello_user_id>)
+    in
+    [
+        !HelloSystemInit($OS, $TS, $ES_SS),
+        OS_Wait_ReleaseRecord_Request(
+            <'SessionToken_3', ~session_id, $App, ~nonce, $IdP, $User, ~hello_user_id, session_sig>,
+            <'ReleaseRecord-AccessToken', release_record_access_token_hash, ~session_id, release_record_access_token_sig>
+        )
+    ]
+  --[
+        ReleaseRecordRequestSent(~session_id, $App, ~nonce, $IdP, $User)
+    ]->
+    [
+        Out_S($OS, $ES_SS, <'ReleaseRecord-AccessToken', release_record_access_token_hash, ~session_id, release_record_access_token_sig>),
+        OS_Wait_ReleaseRecord_Response(
+            <'SessionToken_3', ~session_id, $App, ~nonce, $IdP, $User, ~hello_user_id, session_sig>
+        )
+    ]
+
+rule OS_Receive_And_Verify_ReleaseRecord[role="OS"]:
+    [
+        !HelloSystemInit($OS, $TS, $ES_SS),
+        OS_Wait_ReleaseRecord_Response(
+            <'SessionToken_3', ~session_id, $App, ~nonce, $IdP, $User, ~hello_user_id, session_sig>
+        ),
+        In_S($ES_SS, $OS, <'ReleaseRecord', $App, ~hello_user_id, ~direct_identifier, release_record_sig>),
+        !Pk($TS, ts_pk)
+    ]
+  --[
+        Eq(verify(release_record_sig, <$App, ~hello_user_id, ~direct_identifier>, ts_pk), true)
+    ]->
+    [
+        OS_Wait_Returning_User_Request(
+            <'SessionToken_3', ~session_id, $App, ~nonce, $IdP, $User, ~hello_user_id, session_sig>,
+            <'ReleaseRecord', $App, ~hello_user_id, ~direct_identifier, release_record_sig>
+        )
+    ]
+
+rule OS_Send_Returning_User_Request[role="OS"]:
+    [
+        !HelloSystemInit($OS, $TS, $ES_SS),
+        OS_Wait_Returning_User_Request(
+            <'SessionToken_3', ~session_id, $App, ~nonce, $IdP, $User, ~hello_user_id, session_sig>,
+            <'ReleaseRecord', $App, ~hello_user_id, ~direct_identifier, release_record_sig>
+        )
+    ]
+  --[
+        
+    ]->
+    [
+        Out_S($OS, $TS, <
+            <'SessionToken_3', ~session_id, $App, ~nonce, $IdP, $User, ~hello_user_id, session_sig>,
+            <'ReleaseRecord', $App, ~hello_user_id, ~direct_identifier, release_record_sig>
+        >),
+        OS_Wait_Returning_User_Response(<
+            <'SessionToken_3', ~session_id, $App, ~nonce, $IdP, $User, ~hello_user_id, session_sig>,
+            <'ReleaseRecord', $App, ~hello_user_id, ~direct_identifier, release_record_sig>
+        >)
+    ]
+
+rule OS_Receive_And_Verify_Returning_User_Response[role="OS"]:
+    [
+        !HelloSystemInit($OS, $TS, $ES_SS),
+        OS_Wait_Returning_User_Response(<
+            <'SessionToken_3', ~session_id, $App, ~nonce, $IdP, $User, ~hello_user_id, session_sig>,
+            <'ReleaseRecord', $App, ~hello_user_id, ~direct_identifier, release_record_sig>
+        >),
+        In_S($TS, $OS, <'HelloIdToken', hello_coop, ~direct_identifier, $App, ~nonce, hello_id_token_sig>),
+        !Pk($TS, ts_pk)
+    ]
+  --[
+        Eq(verify(hello_id_token_sig, <hello_coop, ~direct_identifier, $App, ~nonce>, ts_pk), true)
+    ]->
+    [
+        OS_Wait_Finalize_Session(<
+            <'HelloIdToken', hello_coop, ~direct_identifier, $App, ~nonce, hello_id_token_sig>,
+            <'SessionToken_3', ~session_id, $App, ~nonce, $IdP, $User, ~hello_user_id, session_sig>
+        >)
+    ]
+
+rule OS_Send_HelloIdToken[role="OS"]:
+    [
+        !HelloSystemInit($OS, $TS, $ES_SS),
+        OS_Wait_Finalize_Session(<
+            <'HelloIdToken', hello_coop, ~direct_identifier, $App, ~nonce, hello_id_token_sig>,
+            <'SessionToken_3', ~session_id, $App, ~nonce, $IdP, $User, ~hello_user_id, session_sig>
+        >)
+    ]
+  --[
+        OSDeliveredHelloIdToken(~session_id, $App, ~direct_identifier, ~nonce, hello_id_token_sig)
+    ]->
+    [
+        Out_S($OS, $App, <'HelloIdToken', hello_coop, ~direct_identifier, $App, ~nonce, hello_id_token_sig>)
+    ]
+
+/* TS Process Rules */
+rule TS_Handle_CreateSessionToken_Request[role="TS"]:
+    [
+        !HelloSystemInit($OS, $TS, $ES_SS),
+        In_S($OS, $TS, <'CreateSessionToken', <'RequestToken', $App, hello_coop, ~nonce, request_token_sig>>),
+        !App_Registered($App, app_sk),
+        !Ltk($TS, ~ts_sk),
+        !Pk($App, app_pk),
+        Fr(~session_id)
+    ]
+  --[
+        Eq(verify(request_token_sig, <$App, hello_coop, ~nonce>, app_pk), true),
+        SessionTokenCreated(~session_id, $App, ~nonce)/*,
+        OnlyOne('TS_Handle_CreateSessionToken_Request')*/
+    ]->
+    [
+        Out_S($TS, $OS, <'SessionToken_1', ~session_id, $App, ~nonce, sign(<~session_id, $App, ~nonce>, ~ts_sk)>)
+    ]
+
+rule TS_Handle_CreateSubjectRecordAccessToken_Request[role="TS"]:
+    let
+        access_token_hash = h(<$IdP, $User>)
+    in
+    [
+        !HelloSystemInit($OS, $TS, $ES_SS),
+        In_S($OS, $TS, <
+            <'SessionToken_1', ~session_id, $App, ~nonce, session_sig>,
+            <'IdToken', $IdP, $User, ~session_id, id_token_sig>
+        >),
+        !Ltk($TS, ~ts_sk),
+        !Pk($IdP, idp_pk),
+        !Pk($TS, ts_pk)
+    ]
+  --[
+        Eq(verify(session_sig, <~session_id, $App, ~nonce>, ts_pk), true),
+        Eq(verify(id_token_sig, <$IdP, $User, ~session_id>, idp_pk), true),
+        SubjectRecordAccessTokenCreated(~session_id, $App, ~nonce, $IdP, $User)
+    ]->
+    [
+        Out_S($TS, $OS, <
+            <'SessionToken_2', ~session_id, $App, ~nonce, $IdP, $User, sign(<~session_id, $App, ~nonce, $IdP, $User>, ~ts_sk)>,
+            <'SubjectRecord-AccessToken', access_token_hash, ~session_id, sign(<access_token_hash, ~session_id>, ~ts_sk)>
+        >)
+    ]
+
+rule TS_Handle_New_User_Request[role="TS"]:
+    let
+        error_token_hash = h(<$IdP, $User>)
+        hello_id_token_sig = sign(<hello_coop, ~direct_identifier, $App, ~nonce>, ~ts_sk)
+    in
+    [
+        !HelloSystemInit($OS, $TS, $ES_SS),
+        In_S($OS, $TS, <
+            <'SessionToken_2', ~session_id, $App, ~nonce, $IdP, $User, session_sig>,
+            <'ErrorToken', error_token_hash, ~session_id, error_token_sig>
+        >),
+        !Ltk($TS, ~ts_sk),
+        !Pk($TS, ts_pk),
+        !Pk($ES_SS, es_ss_pk),
+        Fr(~hello_user_id),
+        Fr(~direct_identifier)
+    ]
+  --[
+        Eq(h(<$IdP, $User>), error_token_hash),
+        Eq(verify(error_token_sig, <error_token_hash, ~session_id>, es_ss_pk), true),
+        Eq(verify(session_sig, <~session_id, $App, ~nonce, $IdP, $User>, ts_pk), true),
+        HelloIdTokenIssued(~session_id, $App, ~direct_identifier, ~nonce, hello_id_token_sig)
+    ]->
+    [
+        Out_S($TS, $OS, <
+            <'HelloIdToken', hello_coop, ~direct_identifier, $App, ~nonce, hello_id_token_sig>,
+            <'SubjectRecord', $IdP, $User, ~hello_user_id, sign(<$IdP, $User, ~hello_user_id>, ~ts_sk)>,
+            <'SubjectRecord-AccessToken', h(<$IdP, $User>), ~session_id, sign(<h(<$IdP, $User>), ~session_id>, ~ts_sk)>,
+            <'ReleaseRecord', $App, ~hello_user_id, ~direct_identifier, sign(<$App, ~hello_user_id, ~direct_identifier>, ~ts_sk)>,
+            <'ReleaseRecord-AccessToken', h(<$App, ~hello_user_id>), ~session_id, sign(<h(<$App, ~hello_user_id>), ~session_id>, ~ts_sk)>,
+            <'SessionToken_3', ~session_id, $App, ~nonce, $IdP, $User, ~hello_user_id, sign(<~session_id, $App, ~nonce, $IdP, $User, ~hello_user_id>, ~ts_sk)>
+        >)
+    ]
+
+rule TS_Handle_CreateReleaseRecordAccessToken[role="TS"]:
+    [
+        !HelloSystemInit($OS, $TS, $ES_SS),
+        In_S($OS, $TS, <
+            <'SessionToken_2', ~session_id, $App, ~nonce, $IdP, $User, session_sig>,
+            <'SubjectRecord', $IdP, $User, ~hello_user_id, subject_record_sig>
+        >),
+        !Ltk($TS, ~ts_sk),
+        !Pk($TS, ts_pk)    
+    ]
+  --[
+        Eq(verify(session_sig, <~session_id, $App, ~nonce, $IdP, $User, ~hello_user_id>, ts_pk), true),
+        Eq(verify(subject_record_sig, <$IdP, $User, ~hello_user_id>, ts_pk), true),
+        ReleaseRecordAccessTokenCreated(~session_id, $App, ~nonce, $IdP, $User, ~hello_user_id)
+    ]->
+    [
+        Out_S($TS, $OS, <
+            <'SessionToken_3', ~session_id, $App, ~nonce, $IdP, $User, ~hello_user_id, session_sig>,
+            <'ReleaseRecord-AccessToken', h(<$App, ~hello_user_id>), ~session_id, sign(<h(<$App, ~hello_user_id>), ~session_id>, ~ts_sk)>
+        >)
+    ]
+
+rule TS_Handle_Returning_User_Request[role="TS"]:
+    let
+        hello_id_token_sig = sign(<hello_coop, ~direct_identifier, $App, ~nonce>, ~ts_sk)
+    in
+    [
+        !HelloSystemInit($OS, $TS, $ES_SS),
+        In_S($OS, $TS, <
+            <'SessionToken_3', ~session_id, $App, ~nonce, $IdP, $User, ~hello_user_id, session_sig>,
+            <'ReleaseRecord', $App, ~hello_user_id, ~direct_identifier, release_record_sig>
+        >),
+        !Ltk($TS, ~ts_sk),
+        !Pk($TS, ts_pk)
+    ]
+  --[
+        Eq(verify(session_sig, <~session_id, $App, ~nonce, $IdP, $User, ~hello_user_id>, ts_pk), true),
+        Eq(verify(release_record_sig, <$App, ~hello_user_id, ~direct_identifier>, ts_pk), true),
+        HelloIdTokenIssued(~session_id, $App, ~direct_identifier, ~nonce, hello_id_token_sig)
+    ]->
+    [
+        Out_S($TS, $OS, <'HelloIdToken', hello_coop, ~direct_identifier, $App, ~nonce, sign(<~direct_identifier, $App, ~nonce>, ~ts_sk)>)
+    ]
+
+/* ES_SS Process Rules */
+rule ES_SS_Handle_SubjectRecord_Request_NotFound[role="ES_SS"]:
+    let
+        access_token_hash = h(<$IdP, $User>)
+    in
+    [
+        !HelloSystemInit($OS, $TS, $ES_SS),
+        In_S($OS, $ES_SS, <'SubjectRecord-AccessToken', access_token_hash, ~session_id, access_token_sig>),
+        !Pk($TS, ts_pk),
+        !Ltk($ES_SS, ~es_ss_sk)
+    ]
+  --[
+        Eq(verify(access_token_sig, <access_token_hash, ~session_id>, ts_pk), true),
+        SubjectRecordNotFound(access_token_hash)
+    ]->
+    [
+        Out_S($ES_SS, $OS, <'ErrorToken', access_token_hash, ~session_id, sign(<access_token_hash, ~session_id>, ~es_ss_sk)>)
+    ]
+
+rule ES_SS_Handle_SubjectRecord_Request_Found[role="ES_SS"]:
+    let
+        access_token_hash = h(<$IdP, $User>)
+    in
+    [
+        !HelloSystemInit($OS, $TS, $ES_SS),
+        In_S($OS, $ES_SS, <'SubjectRecord-AccessToken', access_token_hash, ~session_id, access_token_sig>),
+        !Pk($TS, ts_pk),
+        !SubjectRecordStore(
+            access_token_hash,
+            <'SubjectRecord', $IdP, $User, ~hello_user_id, subject_record_sig>
+        )
+    ]
+  --[
+        Eq(verify(access_token_sig, <access_token_hash, ~session_id>, ts_pk), true),
+        Eq(verify(subject_record_sig, <$IdP, $User, ~hello_user_id>, ts_pk), true),
+        SubjectRecordFound(access_token_hash, $IdP, $User, ~hello_user_id, subject_record_sig)
+    ]->
+    [
+        Out_S($ES_SS, $OS, <'SubjectRecord', $IdP, $User, ~hello_user_id, subject_record_sig>)
+    ]
+
+rule ES_SS_Handle_ReleaseRecord_Request[role="ES_SS"]:
+    let
+        access_token_hash = h(<$App, ~hello_user_id>)
+    in
+    [
+        !HelloSystemInit($OS, $TS, $ES_SS),
+        In_S($OS, $ES_SS, <'ReleaseRecord-AccessToken', access_token_hash, ~session_id, access_token_sig>),
+        !Pk($TS, ts_pk),
+        !ReleaseRecordStore(
+            access_token_hash,
+            <'ReleaseRecord', $App, ~hello_user_id, ~direct_identifier, release_record_sig>
+        )
+    ]
+  --[
+        Eq(verify(access_token_sig, <access_token_hash, ~session_id>, ts_pk), true),
+        Eq(verify(release_record_sig, <$App, ~hello_user_id, ~direct_identifier>, ts_pk), true),
+        ReleaseRecordFound(access_token_hash, $App, ~hello_user_id, ~direct_identifier, release_record_sig)
+    ]->
+    [
+        Out_S($ES_SS, $OS, <'ReleaseRecord', $App, ~hello_user_id, ~direct_identifier, release_record_sig>)
+    ]
+
+rule ES_SS_Handle_StoreRecord_Request[role="ES_SS"]:
+    let
+        subject_record_access_token_hash = h(<$IdP, $User>)
+        release_record_access_token_hash = h(<$App, ~hello_user_id>)
+    in
+    [
+        !HelloSystemInit($OS, $TS, $ES_SS),
+        In_S($OS, $ES_SS, <
+            <'SubjectRecord', $IdP, $User, ~hello_user_id, subject_record_sig>,
+            <'SubjectRecord-AccessToken', subject_record_access_token_hash, ~session_id, subject_record_access_token_sig>,
+            <'ReleaseRecord', $App, ~hello_user_id, ~direct_identifier, release_record_sig>,
+            <'ReleaseRecord-AccessToken', release_record_access_token_hash, ~session_id, release_record_access_token_sig>
+        >),
+        !Pk($TS, ts_pk)
+    ]
+  --[
+        Eq(verify(subject_record_sig, <$IdP, $User, ~hello_user_id>, ts_pk), true),
+        Eq(verify(subject_record_access_token_sig, <subject_record_access_token_hash, ~session_id>, ts_pk), true),
+        Eq(verify(release_record_sig, <$App, ~hello_user_id, ~direct_identifier>, ts_pk), true),
+        Eq(verify(release_record_access_token_sig, <release_record_access_token_hash, ~session_id>, ts_pk), true),
+        ES_SS_Received_StoreRecord_Request()
+    ]->
+    [
+        !SubjectRecordStore(
+            subject_record_access_token_hash,
+            <'SubjectRecord', $IdP, $User, ~hello_user_id, subject_record_sig>
+        ),
+        !ReleaseRecordStore(
+            release_record_access_token_hash,
+            <'ReleaseRecord', $App, ~hello_user_id, ~direct_identifier, release_record_sig>
+        )
+    ]
+
+restriction Equality:
+    "All x y #i. Eq(x,y) @i ==> x = y"
+
+restriction Inequality:
+    "All x #i. Neq(x,x) @ #i ==> F"
+
+/* Uniqueness Constraints */
+restriction only_one_rule_instance:
+  "(All x #i #j. (OnlyOne(x)@i & OnlyOne(x)@j) ==> (#i = #j))"
+
+// lemma nonce_Sources[sources]:
+//   "All app_id direct_identifier nonce hello_id_token_sig #i.
+//     RPLoginAccepted(app_id, direct_identifier, nonce, hello_id_token_sig)@i
+//     ==>
+//       ( (Ex #j. KU(nonce)@j & #j < #i)
+//       | (Ex #j. RequestSent(app_id, nonce)@j) )
+//   "
+
+// lemma SessionID_Sources[sources]:
+//   "All session_id app nonce #i.
+//     SessionStarted(session_id, app, nonce)@i
+//     ==>
+//       ( (Ex #j. KU(session_id)@j & #j < #i)
+//       | (Ex #j. SessionTokenCreated(session_id, app, nonce)@j) )
+//    "
+
+// lemma channel_sources [sources]:
+//   "All A B x #i.
+//       ChanIn_S(A,B,x)@i
+//       ==>
+//         ( (Ex #j. KU(x)@j & #j < #i)
+//         | (Ex #j. ChanOut_S(A,B,x)@j & #j < #i)
+//         )
+//   "
+
+lemma executable:
+  exists-trace
+    "Ex #i. Finish()@#i"
+
+lemma Nonce_Not_Reused:
+  "All app_id di1 di2 nonce sig1 sig2 #i #j.
+      (RPLoginAccepted(app_id, di1, nonce, sig1)@i &
+       RPLoginAccepted(app_id, di2, nonce, sig2)@j)
+      ==> (#i = #j & di1 = di2 & sig1 = sig2)"
+
+lemma Hello_User_Authentication[use_induction]:
+  "All app_id direct_identifier nonce hello_id_token_sig #finish.
+        RPLoginAccepted(app_id, direct_identifier, nonce, hello_id_token_sig)@#finish
+        ==>
+        (Ex session_id idp idp_user #start #user #issued.
+            SessionStarted(session_id, app_id, nonce)@#start
+            & UserParticipated(idp, idp_user, session_id)@#user
+            & HelloIdTokenIssued(session_id, app_id, direct_identifier, nonce, hello_id_token_sig)@#issued
+            & #start < #user
+            & #user < #issued
+            & #issued < #finish
+        )
+    "
+
+end

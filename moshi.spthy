@@ -1,0 +1,433 @@
+theory Moshi_Protocol_Rules
+begin
+
+builtins: hashing, signing
+
+functions:
+    none/0,
+    hello_coop/0,
+    hmac/2,
+
+/* Explicit secure-channel semantics with sender and receiver. */
+rule ChanOut_S[role="Channel"]:
+        [ Out_S($A,$B,x) ]
+      --[ ChanOut_S($A,$B,x) ]->
+        [ !Sec($A,$B,x) ]
+
+rule ChanIn_S[role="Channel"]:
+        [ !Sec($A,$B,x) ]
+      --[ ChanIn_S($A,$B,x) ]->
+        [ In_S($A,$B,x) ]
+
+/* Rule representing the App registration in the Hello System */
+rule Register_App[role="App"]:
+    [
+        Fr(~app_sk),
+        !HelloSystemInit($AB, $IB, $TTS)
+    ]
+  --[
+        App_Initialized($App, ~app_sk),
+        Key_Pair_Generated($App, ~app_sk),
+        Neq($AB, $App), Neq($IB, $App), Neq($TTS, $App),
+        OnlyOne('Register_App')
+    ]->
+    [
+        !Ltk($App, ~app_sk), !Pk($App, pk(~app_sk)), !App_Registered($App, ~app_sk)
+    ]
+
+rule App_SendRequestToken[role="App"]:
+    [
+        !App_Registered($App, ~app_sk),
+        !Ltk($App, ~app_sk),
+        Fr(~nonce),
+        !HelloSystemInit($AB, $IB, $TTS)
+    ]
+  --[
+        OnlyOne(<$App, ~nonce>),
+        RequestSent($App, ~nonce)
+    ]->
+    [
+        Out_S($App, $AB, <'RequestToken', $App, ~nonce, sign(<$App, ~nonce>, ~app_sk)>),
+        App_Session($App, ~nonce)
+    ]
+
+rule App_ReceiveHelloIdToken[role="App"]:
+    [
+        !HelloSystemInit($AB, $IB, $TTS),
+        App_Session($App, ~nonce),
+        In_S($AB, $App, <'HelloIdToken', direct_identifier, blind_app_id, ~nonce, hello_id_token_sig>),
+        !Pk($TTS, tts_pk)
+    ]
+  --[
+        Eq(verify(hello_id_token_sig, <direct_identifier, blind_app_id, ~nonce>, tts_pk), true),
+        Neq($TTS, $App), Neq($App, $AB),
+        RPLoginAccepted(blind_app_id, direct_identifier, ~nonce, hello_id_token_sig),
+        AppSeesHelloIdToken($App, blind_app_id, direct_identifier),
+        Finish()
+    ]->
+    [ ]
+
+/* IdP Process Rules */
+rule IdP_Init[role="IdP"]:
+    [
+        Fr(~idp_sk),
+        !HelloSystemInit($AB, $IB, $TTS)
+    ]
+  --[
+        IdP_Initialized(),
+        OnlyOne('IdP_Init'),
+        Neq($AB, $IdP), Neq($IB, $IdP), Neq($TTS, $IdP),
+        Key_Pair_Generated($IdP, ~idp_sk)
+    ]->
+    [
+        !Pk($IdP, pk(~idp_sk)), !Ltk($IdP, ~idp_sk), !IdP_Init($IdP, ~idp_sk)
+    ]
+
+rule IdP_Register_Users[role="IdP"]:
+    [ !IdP_Init($IdP, ~idp_sk) ]
+  --[ UserRegistered($IdP, $User) ]->
+    [ !IdPUser($IdP, $User) ]
+
+rule IdP_Receive_OIDCRequest[role="IdP"]:
+    [
+        !IdP_Init($IdP, ~idp_sk),
+        !HelloSystemInit($AB, $IB, $TTS),
+        In_S($IB, $IdP, <'OIDCRequest', ~session_id>),
+        !Ltk($IdP, ~idp_sk),
+        !IdPUser($IdP, $User) 
+    ]
+  --[
+        // OIDCRequestReceived(~session_id),
+        UserParticipated($IdP, $User, ~session_id),
+        Neq($AB, $IdP), Neq($IB, $IdP), Neq($TTS, $IdP)
+    ]->
+    [
+        Out_S($IdP, $IB, <'IdToken', $IdP, $User, ~session_id, sign(<$IdP, $User, ~session_id>, ~idp_sk)>)
+    ]
+
+/* Hello System Init */
+rule Hello_Init[role="HelloSystem"]:
+    [
+        Fr(~ab_sk), Fr(~ib_sk), Fr(~tts_sk),
+        Fr(~kAB), Fr(~kIB), Fr(~kTTS)
+    ]
+  --[
+        HelloSystemInitialized(),
+        OnlyOne('Hello_Init'),
+
+        Key_Pair_Generated($AB, ~ab_sk),
+        Key_Pair_Generated($IB, ~ib_sk),
+        Key_Pair_Generated($TTS, ~tts_sk),
+
+        BlindingKey_Generated($AB),
+        BlindingKey_Generated($IB),
+        BlindingKey_Generated($TTS),
+
+        Neq($AB, $IB), Neq($AB, $TTS), Neq($IB, $TTS)
+    ]->
+    [
+        !Pk($AB, pk(~ab_sk)), !Ltk($AB, ~ab_sk),
+        !Pk($IB, pk(~ib_sk)), !Ltk($IB, ~ib_sk),
+        !Pk($TTS, pk(~tts_sk)), !Ltk($TTS, ~tts_sk),
+
+        !K_AB($AB, ~kAB),
+        !K_IB($IB, ~kIB),
+        !K_TTS($TTS, ~kTTS),
+
+        !HelloSystemInit($AB, $IB, $TTS)
+    ]
+
+#ifdef Compromise
+rule CompromiseAB[role="Attacker"]:
+    [
+        !Ltk($AB, ~ab_sk),
+        !HelloSystemInit($AB, $IB, $TTS)
+    ]
+  --[
+        Compromised($AB),
+        OnlyOne('ServiceCompromise')
+    ]->
+    [
+        !CompromisedService($AB),
+        Out(~ab_sk)
+    ]
+
+rule CompromiseIB[role="Attacker"]:
+    [
+        !Ltk($IB, ~ib_sk),
+        !HelloSystemInit($AB, $IB, $TTS)
+    ]
+  --[
+        Compromised($IB),
+        OnlyOne('ServiceCompromise')
+     ]->
+    [
+        !CompromisedService($IB),
+        Out(~ib_sk)
+    ]
+
+rule CompromiseTTS[role="Attacker"]:
+    [
+        !Ltk($TTS, ~tts_sk),
+        !HelloSystemInit($AB, $IB, $TTS)
+    ]
+  --[
+        Compromised($TTS),
+        OnlyOne('ServiceCompromise')
+    ]->
+    [
+        !CompromisedService($TTS),
+        Out(~tts_sk)
+    ]
+
+rule CompromiseABMessage[role="Attacker"]:
+    [
+        !CompromisedService($AB),
+        !HelloSystemInit($AB, $IB, $TTS),
+        In(x), In($B)
+    ]
+  --[
+        CompromisedMessage($AB, x)
+    ]->
+    [
+        Out_S($AB, $B, x)
+    ]
+
+rule CompromiseIBMessage[role="Attacker"]:
+    [
+        !CompromisedService($IB),
+        !HelloSystemInit($AB, $IB, $TTS),
+        In(x), In($B)
+    ]
+  --[
+        CompromisedMessage($IB, x)
+    ]->
+    [
+        Out_S($IB, $B, x)
+    ]
+
+rule CompromiseTTSMessage[role="Attacker"]:
+    [
+        !CompromisedService($TTS),
+        !HelloSystemInit($AB, $IB, $TTS),
+        In(x), In($B)
+    ]
+  --[
+        CompromisedMessage($TTS, x)
+    ]->
+    [
+        Out_S($TTS, $B, x)
+    ]
+#endif
+
+/* AB Process Rules */
+rule AB_Receive_And_Verify_RequestToken[role="AB"]:
+    [
+        !HelloSystemInit($AB, $IB, $TTS),
+        In_S($App, $AB, <'RequestToken', $App, ~nonce, request_token_sig>),
+        !App_Registered($App, ~app_sk),
+        !Pk($App, app_pk)
+    ]
+  --[
+        // Test(),
+        Eq(verify(request_token_sig, <$App, ~nonce>, app_pk), true),
+        // AB_Received_RequestToken($App, ~nonce),
+        OnlyOne(<'AB', $App, ~nonce>)
+    ]->
+    [
+        AB_Wait_Delegate_Auth($App, ~nonce)
+    ]
+
+rule AB_Delegate_Auth[role="AB"]:
+    let
+        blind_app_id = hmac(kAB, $App)
+        delegate_auth_sig = sign(<blind_app_id, ~nonce, ~session_id>, ~ab_sk)
+    in
+    [
+        !HelloSystemInit($AB, $IB, $TTS),
+        AB_Wait_Delegate_Auth($App, ~nonce),
+        !K_AB($AB, kAB),
+        !Ltk($AB, ~ab_sk),
+        Fr(~session_id)
+    ]
+  --[
+        AB_Sent_Delegate_Auth($App, ~nonce),
+        AB_Received_RequestToken(blind_app_id, ~nonce)
+    ]->
+    [
+        Out_S($AB, $IB, <'DelegateAuth', blind_app_id, ~nonce, ~session_id, delegate_auth_sig>),
+        AB_Wait_Delegate_Auth_Response($App, ~nonce, ~session_id)
+    ]
+
+rule AB_Receive_HelloIdToken[role="AB"]:
+    [
+        !HelloSystemInit($AB, $IB, $TTS),
+        AB_Wait_Delegate_Auth_Response($App, ~nonce, ~session_id),
+        !Pk($TTS, tts_pk),
+        !Ltk($AB, ~ab_sk),
+        !K_AB($AB, kAB),
+        In_S($TTS, $AB, <~session_id, <'HelloIdToken', direct_identifier, blind_app_id, ~nonce, hello_id_token_sig>, message_sig>)
+    ]
+  --[
+        // Test(),
+        Eq(verify(message_sig, <~session_id, <'HelloIdToken', direct_identifier, blind_app_id, ~nonce, hello_id_token_sig>>, tts_pk), true),
+        Eq(verify(hello_id_token_sig, <direct_identifier, blind_app_id, ~nonce>, tts_pk), true),
+        Eq(blind_app_id, hmac(kAB, $App)),
+        AB_Received_HelloIdToken(blind_app_id, ~nonce, ~session_id, direct_identifier, hello_id_token_sig)
+    ]->
+    [
+        AB_Wait_Hello_Token_Send(blind_app_id, ~nonce, ~session_id, direct_identifier, hello_id_token_sig)
+    ]
+
+rule AB_Send_HelloIdToken[role="AB"]:
+    [
+        !HelloSystemInit($AB, $IB, $TTS),
+        AB_Wait_Hello_Token_Send(blind_app_id, ~nonce, ~session_id, direct_identifier, hello_id_token_sig),
+        !Pk($TTS, tts_pk),
+        !Ltk($AB, ~ab_sk)
+    ]
+  --[
+        ABDeliveredHelloIdToken(~session_id, blind_app_id, direct_identifier, ~nonce, hello_id_token_sig)
+    ]->
+    [
+        Out_S($AB, $App, <'HelloIdToken', direct_identifier, blind_app_id, ~nonce, hello_id_token_sig>)
+    ]
+
+/* IB Process Rules */
+rule IB_Receive_Delegate_Auth[role="IB"]:
+    [
+        !HelloSystemInit($AB, $IB, $TTS),
+        In_S($AB, $IB, <'DelegateAuth', blind_app_id, ~nonce, ~session_id, delegate_auth_sig>),
+        !Pk($AB, ab_pk)
+    ]
+  --[
+        // Test(),
+        Eq(verify(delegate_auth_sig, <blind_app_id, ~nonce, ~session_id>, ab_pk), true),
+        IB_Received_Delegate_Auth(blind_app_id, ~session_id)
+    ]->
+    [
+        IB_Wait_OIDC_Request(blind_app_id, ~nonce, ~session_id)
+    ]
+
+rule IB_Send_OIDC_Request[role="IB"]:
+    [
+        !HelloSystemInit($AB, $IB, $TTS),
+        IB_Wait_OIDC_Request(blind_app_id, ~nonce, ~session_id)
+    ]
+  --[
+        OIDC_Request_Sent(blind_app_id, ~session_id),
+        Neq($AB, $IdP), Neq($IdP, $IB), Neq($IdP, $TTS)
+    ]->
+    [
+        Out_S($IB, $IdP, <'OIDCRequest', ~session_id>),
+        IB_Wait_OIDC_Response(blind_app_id, ~nonce, ~session_id)
+    ]
+
+rule IB_Receive_And_Verify_IdToken[role="IB"]:
+    [
+        !HelloSystemInit($AB, $IB, $TTS),
+        IB_Wait_OIDC_Response(blind_app_id, ~nonce, ~session_id),
+        In_S($IdP, $IB, <'IdToken', $IdP, $User, ~session_id, id_token_sig>),
+        !Pk($IdP, idp_pk)
+    ]
+  --[
+        Eq(verify(id_token_sig, <$IdP, $User, ~session_id>, idp_pk), true),
+        IdTokenReceived($IdP, $User, ~session_id, id_token_sig)
+    ]->
+    [
+        IB_Wait_Hello_Info_Request(blind_app_id, ~nonce, ~session_id, $IdP, $User)
+    ]
+
+rule IB_Send_Hello_Info_Request[role="IB"]: 
+    let 
+        blind_idp = hmac(kIB, $IdP)
+        blind_user = hmac(kIB, $User)
+        hello_info_request_sig = sign(<blind_app_id, ~nonce, ~session_id, blind_idp, blind_user>, ~ib_sk)
+    in
+    [
+        !HelloSystemInit($AB, $IB, $TTS),
+        IB_Wait_Hello_Info_Request(blind_app_id, ~nonce, ~session_id, $IdP, $User),
+        !K_IB($IB, kIB),
+        !Ltk($IB, ~ib_sk)
+    ]
+  --[
+        HelloInfoRequestSent(blind_app_id, ~nonce, ~session_id, $IdP, $User)
+    ]->
+    [
+        Out_S($IB, $TTS, <'HelloInfoRequest', blind_app_id, ~nonce, ~session_id, blind_idp, blind_user, hello_info_request_sig>),
+        IB_Wait_Hello_Info_Response(blind_app_id, ~nonce, ~session_id, $IdP, $User)
+    ]
+
+/* TTS Process Rules */
+/* In this rule we simulate the FROST and threshold signature schemes - acts as a oracle that simply mints HellInfo (which is basically just the DI) */
+rule TTS_Receive_Hello_Info_Request[role="TTS"]:
+    [
+        !HelloSystemInit($AB, $IB, $TTS),
+        In_S($IB, $TTS, <'HelloInfoRequest', blind_app_id, ~nonce, ~session_id, blind_idp, blind_user, hello_info_request_sig>),
+        !Pk($IB, ib_pk),
+        !Ltk($TTS, ~tts_sk)
+    ]
+  --[
+        // Test(),
+        Eq(verify(hello_info_request_sig, <blind_app_id, ~nonce, ~session_id, blind_idp, blind_user>, ib_pk), true),
+        HelloInfoRequestReceived(blind_app_id, ~nonce, ~session_id, $IdP, $User)
+    ]->
+    [
+        TS_Wait_Hello_Info_Response(blind_app_id, ~nonce, ~session_id, blind_idp, blind_user)
+    ]
+
+rule TTS_Send_Hello_Info_Response[role="TTS"]:
+    let
+        direct_identifier = hmac(kTTS, <blind_app_id, blind_idp, blind_user>)
+        hello_id_token_sig = sign(<direct_identifier, blind_app_id, ~nonce>, ~tts_sk)
+        hello_id_token = <'HelloIdToken', direct_identifier, blind_app_id, ~nonce, hello_id_token_sig>
+        message_sig = sign(<~session_id, hello_id_token>, ~tts_sk)
+    in
+    [
+        !HelloSystemInit($AB, $IB, $TTS),
+        TS_Wait_Hello_Info_Response(blind_app_id, ~nonce, ~session_id, blind_idp, blind_user),
+        !K_TTS($TTS, kTTS),
+        !Ltk($TTS, ~tts_sk)
+    ]
+  --[
+        HelloIdTokenIssued(blind_app_id, ~nonce, direct_identifier, hello_id_token_sig)
+    ]->
+    [
+        Out_S($TTS, $AB, <~session_id, hello_id_token, message_sig>)
+    ]
+
+restriction Equality:
+    "All x y #i. Eq(x,y) @i ==> x = y"
+
+restriction Inequality:
+    "All x #i. Neq(x,x) @ #i ==> F"
+
+/* Uniqueness Constraints */
+restriction only_one_rule_instance:
+  "(All x #i #j. (OnlyOne(x)@i & OnlyOne(x)@j) ==> (#i = #j))"
+
+lemma executable:
+  exists-trace
+    "Ex #i. Finish()@#i"
+
+lemma Nonce_Not_Reused:
+  "All blind_app_id di1 di2 nonce sig1 sig2 #i #j.
+      (RPLoginAccepted(blind_app_id, di1, nonce, sig1)@i &
+       RPLoginAccepted(blind_app_id, di2, nonce, sig2)@j)
+      ==> (#i = #j & di1 = di2 & sig1 = sig2)"
+
+lemma Hello_User_Authentication[use_induction]:
+  "All blind_app_id direct_identifier nonce hello_id_token_sig #finish.
+        RPLoginAccepted(blind_app_id, direct_identifier, nonce, hello_id_token_sig)@#finish
+        ==>
+        (Ex sid idp idp_user #start #user #issued.
+            AB_Received_RequestToken(blind_app_id, nonce)@#start
+            & UserParticipated(idp, idp_user, sid)@#user
+            & HelloIdTokenIssued(blind_app_id, nonce, direct_identifier, hello_id_token_sig)@#issued
+            & #start < #user
+            & #user < #issued
+            & #issued < #finish
+        )
+    "
+
+end
